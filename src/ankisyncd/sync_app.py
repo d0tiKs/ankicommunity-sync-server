@@ -21,11 +21,13 @@ import logging
 import os
 import random
 import re
+import struct
 import sys
 import time
 import unicodedata
 import zipfile
 import types
+import pyzstd
 from webob import Response
 from webob.exc import *
 import urllib.parse
@@ -41,6 +43,76 @@ from ankisyncd.users import get_user_manager
 
 logger = logging.getLogger("ankisyncd")
 
+IO_MAGIC = b"\x42\xb5\x2f\xfd"
+
+
+def decode_io_frame(data):
+    """Decode an Anki binary IO frame, returning the payload bytes."""
+    if len(data) < 8:
+        return data
+    magic = data[:4]
+    if magic != IO_MAGIC:
+        return data
+    orig_size = struct.unpack(">I", data[4:8])[0]
+    payload = data[8:]
+    try:
+        payload = gzip.decompress(payload)
+    except Exception:
+        pass
+    return payload
+
+
+def encode_io_frame(data):
+    """Encode data into an Anki binary IO frame (always gzip-compressed)."""
+    raw = data if isinstance(data, bytes) else data.encode("utf-8")
+    compressed = gzip.compress(raw)
+    header = IO_MAGIC + struct.pack(">I", len(raw))
+    return header + compressed
+
+
+def parse_anki_sync_header(environ):
+    """Parse the anki-sync header, returning dict or None."""
+    header = environ.get("HTTP_ANKI_SYNC")
+    if header:
+        try:
+            return json.loads(header)
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+def decode_octet_stream_body(body_bytes, environ):
+    """Decode an octet-stream body: ZSTD (v11+) or legacy IO frame.
+
+    Returns either a dict (parsed JSON) or a bytes object (raw data).
+    """
+    anki_sync = parse_anki_sync_header(environ)
+    if anki_sync and anki_sync.get("v", 0) >= 11:
+        # ZSTD-compressed request body
+        decompressed = pyzstd.decompress(body_bytes)
+        try:
+            result = json.loads(decompressed.decode())
+        except (UnicodeDecodeError, ValueError):
+            # Binary data (e.g. upload), return wrapped in "data" key
+            result = {"data": decompressed}
+            result["v"] = anki_sync["v"]
+            result["k"] = anki_sync.get("k", "")
+            result["s"] = anki_sync.get("s", "")
+            result["cv"] = anki_sync.get("c", "")
+            return result
+        # Merge header fields into data dict
+        result["v"] = anki_sync["v"]
+        result["k"] = anki_sync.get("k", "")
+        result["s"] = anki_sync.get("s", "")
+        result["cv"] = anki_sync.get("c", "")
+        return result
+    # Legacy IO frame decoding
+    body = decode_io_frame(body_bytes)
+    try:
+        return json.loads(body.decode())
+    except (ValueError, UnicodeDecodeError):
+        return {"data": body}
+
 
 class SyncCollectionHandler(Syncer):
     operations = [
@@ -52,6 +124,7 @@ class SyncCollectionHandler(Syncer):
         "applyChunk",
         "sanityCheck2",
         "finish",
+        "abort",
     ]
 
     def __init__(self, col, session):
@@ -64,8 +137,17 @@ class SyncCollectionHandler(Syncer):
         if not cv:
             return False
 
+        parts = cv.split(",")
+        if len(parts) < 3:
+            return False
+
+        client, version, platform = parts[0], parts[1], parts[2]
+
+        # New version format (25.x+): client is numeric (e.g. "25.09.4")
+        if client and client[0].isdigit():
+            return False
+
         note = {"alpha": 0, "beta": 0, "rc": 0}
-        client, version, platform = cv.split(",")
 
         if "arch" not in version:
             for name in note.keys():
@@ -74,8 +156,10 @@ class SyncCollectionHandler(Syncer):
                     version = vs[0]
                     note[name] = int(vs[-1])
 
-        # convert the version string, ignoring non-numeric suffixes like in beta versions of Anki
+        # convert the version string, ignoring non-numeric suffixes
         version_nosuffix = re.sub(r"[^0-9.].*$", "", version)
+        if not version_nosuffix:
+            return False
         version_int = [int(x) for x in version_nosuffix.split(".")]
 
         if client == "ankidesktop":
@@ -115,15 +199,18 @@ class SyncCollectionHandler(Syncer):
             "scm": self.scm(),
             "usn": self.col.usn(),
             "ts": anki.utils.intTime(),
-            "musn": self.col.media.lastUsn(),
+            "media_usn": self.col.media.lastUsn(),
             "uname": self.session.name,
             "msg": "",
             "cont": True,
             "hostNum": 0,
         }
 
+    # v11 uses usn=-1 for pending items; usn>=minUsn would include items
+    # modified during this session (e.g. by applyGraves), causing them to
+    # be re-sent to the client.
     def usnLim(self):
-        return "usn >= %d" % self.minUsn
+        return "usn = -1"
 
     # ankidesktop >=2.1rc2 sends graves in applyGraves, but still expects
     # server-side deletions to be returned by start
@@ -170,6 +257,9 @@ class SyncCollectionHandler(Syncer):
 
     def finish(self):
         return super().finish(anki.utils.intTime(1000))
+
+    def abort(self):
+        return "OK"
 
     # This function had to be put here in its entirety because Syncer.removed()
     # doesn't use self.usnLim() (which we override in this class) in queries.
@@ -472,39 +562,98 @@ class Requests(object):
         env = self.environ
         query_string = env["QUERY_STRING"]
         content_len = env.get("CONTENT_LENGTH", "0")
+        content_type = env.get("CONTENT_TYPE", "")
         input = env.get("wsgi.input")
         length = 0 if content_len == "" else int(content_len)
         body = b""
         request_items_dict = {}
+        te = env.get("HTTP_TRANSFER_ENCODING", "0")
+
+        parse_logger = logging.getLogger("ankisyncd.parse")
+
+        parse_logger.info("parse start: path=%s ct=%s te=%s len=%s", 
+                          env.get("PATH_INFO"), content_type, te, length)
+
+        if "application/json" in content_type and length > 0:
+            body = env["wsgi.input"].read(length)
+            try:
+                result = json.loads(body.decode())
+                parse_logger.info("parse json ok: %s", result)
+                return result
+            except (ValueError, UnicodeDecodeError):
+                parse_logger.info("parse json fail, returning empty")
+                return request_items_dict
+
+        if "application/octet-stream" in content_type and length > 0:
+            body = env["wsgi.input"].read(length)
+            parse_logger.info("parse octet-stream raw: %s bytes head=%s", len(body), body[:30].hex())
+            result = decode_octet_stream_body(body, env)
+            if isinstance(result, dict):
+                parse_logger.info("parse octet-stream json: %s", result)
+                return result
+            request_items_dict["data"] = result
+            parse_logger.info("parse octet-stream as data: %s", result[:40])
+            return request_items_dict
+
         if length == 0:
             if input is None:
+                parse_logger.info("parse: no input, returning empty")
                 return request_items_dict
             if env.get("HTTP_TRANSFER_ENCODING", "0") == "chunked":
-                # readlines and read(no argument) will block
-                # convert byte str to number base 16
-                leng = int(input.readline(), 16)
-                c = 0
-                bdry = b""
+                # read all chunks from the chunked input stream
+                chunks = []
+                parse_logger.info("parse chunked: reading chunks")
+                while True:
+                    line = input.readline()
+                    if not line:
+                        parse_logger.info("parse chunked: EOF before chunk size")
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        leng = int(line, 16)
+                    except ValueError:
+                        parse_logger.info("parse chunked: invalid chunk size: %r", line)
+                        break
+                    if leng == 0:
+                        parse_logger.info("parse chunked: end of chunks")
+                        break
+                    dt = input.read(leng)
+                    if len(dt) != leng:
+                        parse_logger.info("parse chunked: short read %d != %d", len(dt), leng)
+                    chunks.append(dt)
+                    # consume trailing CRLF
+                    input.read(2)
+                # For octet-stream, all chunks form the raw data (ZSTD streaming)
+                if "application/octet-stream" in content_type:
+                    body = b"".join(chunks)
+                    parse_logger.info("parse chunked octet-stream: %s total bytes", len(body))
+                    result = decode_octet_stream_body(body, env)
+                    if isinstance(result, dict):
+                        parse_logger.info("parse chunked octet-stream: decoded json: %s", result)
+                        return result
+                    request_items_dict["data"] = result
+                    parse_logger.info("parse chunked octet-stream: decoded as data: %s", result[:40] if isinstance(result, bytes) else result)
+                    return request_items_dict
+                # Legacy multipart parsing (pre-v11 protocol)
+                bdry = chunks[0] if c >= 1 else b""
                 data = []
                 data_other = []
-                while leng > 0:
-                    c += 1
-                    dt = input.read(leng + 2)
-                    if c == 1:
-                        bdry = dt
-                    elif c >= 3:
-                        # data
-                        data_other.append(dt)
-                    leng = int(input.readline(), 16)
+                for i, chunk in enumerate(chunks):
+                    if i == 0:
+                        continue  # skip boundary
+                    data_other.append(chunk)
                 data_other = [item for item in data_other if item != b"\r\n\r\n"]
                 for item in data_other:
                     if bdry in item:
                         break
-                    # only strip \r\n if there are extra \n
-                    # eg b'?V\xc1\x8f>\xf9\xb1\n\r\n'
                     data.append(item[:-2])
                 request_items_dict["data"] = b"".join(data)
                 others = data_other[len(data) :]
+                if not others:
+                    parse_logger.info("parse chunked multipart: no others, keys=%s", list(request_items_dict.keys()))
+                    return request_items_dict
                 boundary = others[0]
                 others = b"".join(others).split(boundary.strip())
                 others.pop()
@@ -531,7 +680,6 @@ class Requests(object):
 
         if body is None or body == b"":
             return request_items_dict
-            # process body to dict
         repeat = body.splitlines()[0]
         items = re.split(repeat, body)
         # del first ,last item
@@ -564,6 +712,7 @@ class Requests(object):
             key = re.findall(b'name="(.*?)"', item)[0].decode("utf-8")
             v = item[item.rfind(b'"') + 1 :].decode("utf-8")
             request_items_dict[key] = v
+        parse_logger.info("parse multipart result: %s", request_items_dict)
         return request_items_dict
 
 
@@ -577,13 +726,36 @@ class chunked(object):
         clss = args[0]
         environ = args[1]
         start_response = args[2]
+        logger.info("chunked: path=%s ct=%s len=%s, headers: anki-sync=%s", 
+                     environ.get("PATH_INFO"), environ.get("CONTENT_TYPE"), environ.get("CONTENT_LENGTH"),
+                     environ.get("HTTP_ANKI_SYNC", "NOT SET"))
         b = Requests(environ)
         args = (
             clss,
             b,
         )
-        w = self.__wrapped__(*args, **kwargs)
-        resp = Response(w)
+        try:
+            w = self.__wrapped__(*args, **kwargs)
+        except Exception as e:
+            logger.error("chunked: unhandled exception: %s", e, exc_info=True)
+            raise
+        if "application/octet-stream" in environ.get("CONTENT_TYPE", ""):
+            anki_sync = parse_anki_sync_header(environ)
+            if anki_sync and anki_sync.get("v", 0) >= 11:
+                raw = w.encode("utf-8") if isinstance(w, str) else w
+                compressed = pyzstd.compress(raw)
+                resp = Response(compressed, content_type="application/octet-stream")
+                resp.headers["anki-original-size"] = str(len(raw))
+                logger.info("chunked: zstd response %s bytes -> %s bytes (orig-size=%s)", len(raw), len(compressed), len(raw))
+            else:
+                if isinstance(w, str):
+                    w = encode_io_frame(w)
+                elif isinstance(w, bytes):
+                    w = encode_io_frame(w)
+                resp = Response(w, content_type="application/octet-stream")
+                logger.info("chunked: octet-stream response %s bytes, head hex: %s", len(w), w[:20].hex())
+        else:
+            resp = Response(w)
         return resp(environ, start_response)
 
     def __get__(self, instance, cls):
@@ -646,9 +818,15 @@ class SyncApp:
                 data = gz.read()
 
         try:
-            data = json.loads(data.decode())
+            decoded = data.decode()
+            data = json.loads(decoded)
         except (ValueError, UnicodeDecodeError):
-            data = {"data": data}
+            # Anki binary IO framing: strip leading non-JSON bytes and retry
+            try:
+                json_start = data.index(b"{")
+                data = json.loads(data[json_start:].decode())
+            except (ValueError, UnicodeDecodeError, IndexError):
+                data = {"data": data}
 
         return data
 
@@ -683,30 +861,30 @@ class SyncApp:
         # cgi file can only be read once,and will be blocked after being read once more
         # so i call Requests.parse only once,and bind its return result to properties
         # POST and params (set return result as property values)
+        logger.info("__call__: path=%s ct=%s", req.path, req.environ.get("CONTENT_TYPE"))
         req.params = req.parse
         req.POST = req.params
         try:
-            hkey = req.params["k"]
+            raw = req.POST["data"]
+            data = self._decode_data(raw, 0)
         except KeyError:
-            hkey = None
+            # For IO protocol, req.parse returns JSON directly without "data" wrapper
+            data = {k: v for k, v in req.POST.items() if not isinstance(v, bytes)}
+
+        # IO protocol: all fields are inside the JSON data
+        hkey = data.get("k") or req.params.get("k")
         session = self.session_manager.load(hkey, self.create_session)
         if session is None:
-            try:
-                skey = req.POST["sk"]
+            skey = data.get("s") or req.POST.get("sk")
+            if skey:
                 session = self.session_manager.load_from_skey(skey, self.create_session)
-            except KeyError:
-                skey = None
 
-        try:
-            compression = int(req.POST["c"])
-        except KeyError:
-            compression = 0
+        compression = data.get("c") or int(req.POST.get("c") or 0)
+        if isinstance(compression, str):
+            compression = int(compression)
 
-        try:
-            data = req.POST["data"]
-            data = self._decode_data(data, compression)
-        except KeyError:
-            data = {}
+        # Strip protocol-level keys before passing to operation handler
+        op_data = {k: v for k, v in data.items() if k not in ("k", "s", "c", "v", "cv", "sk", "key", "_pad")}
 
         if req.path.startswith(self.base_url):
             url = req.path[len(self.base_url) :]
@@ -714,6 +892,7 @@ class SyncApp:
                 raise HTTPNotFound()
 
             if url == "hostKey":
+                logger.info("hostKey: data=%s, req.POST keys=%s", data, list(req.POST.keys()))
                 result = self.operation_hostKey(data.get("u"), data.get("p"))
                 if result:
                     return json.dumps(result)
@@ -725,6 +904,7 @@ class SyncApp:
                 raise HTTPForbidden()
 
             if url in SyncCollectionHandler.operations + SyncMediaHandler.operations:
+                logger.info("op: url=%s hkey=%s session=%s", url, hkey, session.name if session else None)
                 # 'meta' passes the SYNC_VER but it isn't used in the handler
                 if url == "meta":
                     if session.skey == None and "s" in req.POST:
@@ -733,11 +913,15 @@ class SyncApp:
                         session.version = data["v"]
                     if "cv" in data:
                         session.client_version = data["cv"]
+                    # Pass v/cv to meta handler (stripped in op_data)
+                    op_data["v"] = data.get("v")
+                    op_data["cv"] = data.get("cv")
 
                     self.session_manager.save(hkey, session)
                     session = self.session_manager.load(hkey, self.create_session)
+                logger.info("op: about to execute url=%s op_data=%s", url, op_data)
                 thread = session.get_thread()
-                result = self._execute_handler_method_in_thread(url, data, session)
+                result = self._execute_handler_method_in_thread(url, op_data, session)
                 # If it's a complex data type, we convert it to JSON
                 if type(result) not in (str, bytes, Response):
                     result = json.dumps(result)
@@ -745,8 +929,9 @@ class SyncApp:
                 return result
 
             elif url == "upload":
+                logger.info("upload: hkey=%s", hkey)
                 thread = session.get_thread()
-                result = thread.execute(self.operation_upload, [data["data"], session])
+                result = thread.execute(self.operation_upload, [op_data["data"], session])
                 return result
 
             elif url == "download":
@@ -768,9 +953,9 @@ class SyncApp:
                 raise HTTPNotFound()
 
             if url == "begin":
-                data["skey"] = session.skey
+                op_data["skey"] = data.get("skey", session.skey)
 
-            result = self._execute_handler_method_in_thread(url, data, session)
+            result = self._execute_handler_method_in_thread(url, op_data, session)
 
             # If it's a complex data type, we convert it to JSON
             if type(result) not in (str, bytes):
@@ -778,6 +963,7 @@ class SyncApp:
 
             return result
 
+        logger.info("fallback return for path=%s", req.path)
         return "Anki Sync Server"
 
     @staticmethod

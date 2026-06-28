@@ -22,7 +22,7 @@ from anki.lang import ngettext
 
 
 # https://github.com/ankitects/anki/blob/04b1ca75599f18eb783a8bf0bdeeeb32362f4da0/rslib/src/sync/http_client.rs#L11
-SYNC_VER = 10
+SYNC_VER = 11
 # https://github.com/ankitects/anki/blob/cca3fcb2418880d0430a5c5c2e6b81ba260065b7/anki/consts.py#L50
 SYNC_ZIP_SIZE = int(2.5 * 1024 * 1024)
 # https://github.com/ankitects/anki/blob/cca3fcb2418880d0430a5c5c2e6b81ba260065b7/anki/consts.py#L51

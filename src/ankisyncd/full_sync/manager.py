@@ -7,11 +7,22 @@ from anki.collection import Collection
 from ankisyncd.exceptions import BadRequestException
 
 
+def _register_unicase_collation(db):
+    """Register the unicase collation on a raw DB connection."""
+    try:
+        db._db.create_collation(
+            "unicase", lambda a, b: (a.lower() > b.lower()) - (a.lower() < b.lower())
+        )
+    except AttributeError:
+        pass
+
+
 class FullSyncManager:
     def test_db(self, db: DB):
         """
         :param anki.db.DB db: the database uploaded from the client.
         """
+        _register_unicase_collation(db)
         if db.scalar("pragma integrity_check") != "ok":
             raise BadRequestException(
                 "Integrity check failed for uploaded collection database file."

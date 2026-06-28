@@ -63,7 +63,10 @@ class CollectionWrapper:
         col = anki.storage.Collection(self.path, server=True)
 
         # Ugly hack, replace default media manager with our custom one
-        col.media.close()
+        try:
+            col.media.close()
+        except AttributeError:
+            pass
         col.media = ankisyncd.media.ServerMediaManager(col)
 
         return col
