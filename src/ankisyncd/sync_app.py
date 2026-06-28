@@ -572,21 +572,21 @@ class Requests(object):
             body = env["wsgi.input"].read(length)
             try:
                 result = json.loads(body.decode())
-                parse_logger.info("parse json ok: %s", result)
+                parse_logger.info("parse json ok (%d bytes)", len(body))
                 return result
             except (ValueError, UnicodeDecodeError):
-                parse_logger.info("parse json fail, returning empty")
+                parse_logger.info("parse json fail (%d bytes), returning empty", len(body))
                 return request_items_dict
 
         if "application/octet-stream" in content_type and length > 0:
             body = env["wsgi.input"].read(length)
-            parse_logger.info("parse octet-stream raw: %s bytes head=%s", len(body), body[:30].hex())
+            parse_logger.info("parse octet-stream raw: %s bytes", len(body))
             result = decode_octet_stream_body(body, env)
             if isinstance(result, dict):
-                parse_logger.info("parse octet-stream json: %s", result)
+                parse_logger.info("parse octet-stream json ok (%d keys)", len(result))
                 return result
             request_items_dict["data"] = result
-            parse_logger.info("parse octet-stream as data: %s", result[:40])
+            parse_logger.info("parse octet-stream as data (%d bytes)", len(result) if isinstance(result, bytes) else len(str(result)))
             return request_items_dict
 
         if length == 0:
@@ -625,10 +625,10 @@ class Requests(object):
                     parse_logger.info("parse chunked octet-stream: %s total bytes", len(body))
                     result = decode_octet_stream_body(body, env)
                     if isinstance(result, dict):
-                        parse_logger.info("parse chunked octet-stream: decoded json: %s", result)
+                        parse_logger.info("parse chunked octet-stream: decoded json ok (%d keys)", len(result))
                         return result
                     request_items_dict["data"] = result
-                    parse_logger.info("parse chunked octet-stream: decoded as data: %s", result[:40] if isinstance(result, bytes) else result)
+                    parse_logger.info("parse chunked octet-stream: decoded as data (%d bytes)", len(result) if isinstance(result, bytes) else len(str(result)))
                     return request_items_dict
                 # Legacy multipart parsing (pre-v11 protocol)
                 bdry = chunks[0] if chunks else b""
@@ -706,7 +706,7 @@ class Requests(object):
             key = re.findall(b'name="(.*?)"', item)[0].decode("utf-8")
             v = item[item.rfind(b'"') + 1 :].decode("utf-8")
             request_items_dict[key] = v
-        parse_logger.info("parse multipart result: %s", request_items_dict)
+        parse_logger.info("parse multipart result: %d keys, data=%d bytes", len(request_items_dict), len(request_items_dict.get("data", b"")))
         return request_items_dict
 
 
@@ -886,7 +886,7 @@ class SyncApp:
                 raise HTTPNotFound()
 
             if url == "hostKey":
-                logger.info("hostKey: data=%s, req.POST keys=%s", data, list(req.POST.keys()))
+                logger.info("hostKey: user=%s, keys=%s", data.get("u"), list(req.POST.keys()))
                 result = self.operation_hostKey(data.get("u"), data.get("p"))
                 if result:
                     return json.dumps(result)
@@ -913,7 +913,7 @@ class SyncApp:
 
                     self.session_manager.save(hkey, session)
                     session = self.session_manager.load(hkey, self.create_session)
-                logger.info("op: about to execute url=%s op_data=%s", url, op_data)
+                logger.info("op: about to execute url=%s (%d keys)", url, len(op_data))
                 thread = session.get_thread()
                 result = self._execute_handler_method_in_thread(url, op_data, session)
                 # If it's a complex data type, we convert it to JSON
