@@ -44,6 +44,7 @@ from ankisyncd.users import get_user_manager
 logger = logging.getLogger("ankisyncd")
 
 IO_MAGIC = b"\x42\xb5\x2f\xfd"
+MAX_ZSTD_DECOMPRESSED_BYTES = 256 * 1024 * 1024
 
 
 def decode_io_frame(data):
@@ -70,6 +71,18 @@ def encode_io_frame(data):
     return header + compressed
 
 
+def decompress_zstd_limited(body_bytes, max_output=MAX_ZSTD_DECOMPRESSED_BYTES):
+    """Decompress zstd data while capping decoded output size."""
+    decompressor = pyzstd.EndlessZstdDecompressor()
+    try:
+        decompressed = decompressor.decompress(body_bytes, max_output + 1)
+    except pyzstd.ZstdError:
+        raise HTTPBadRequest("invalid zstd data")
+    if len(decompressed) > max_output or not decompressor.at_frame_edge:
+        raise HTTPBadRequest("zstd data too large")
+    return decompressed
+
+
 def parse_anki_sync_header(environ):
     """Parse the anki-sync header, returning dict or None."""
     header = environ.get("HTTP_ANKI_SYNC")
@@ -89,12 +102,7 @@ def decode_octet_stream_body(body_bytes, environ):
     anki_sync = parse_anki_sync_header(environ)
     if anki_sync and anki_sync.get("v", 0) >= 11:
         # ZSTD-compressed request body
-        try:
-            decompressed = pyzstd.decompress(body_bytes)
-        except pyzstd.ZstdError:
-            raise HTTPBadRequest("invalid zstd data")
-        if len(decompressed) > 268435456:
-            raise HTTPBadRequest("zstd data too large")
+        decompressed = decompress_zstd_limited(body_bytes)
         try:
             result = json.loads(decompressed.decode())
         except (UnicodeDecodeError, ValueError):
@@ -193,13 +201,15 @@ class SyncCollectionHandler(Syncer):
 
         # Make sure the media database is open!
         self.col.media.connect()
+        media_usn = self.col.media.lastUsn()
 
         return {
             "mod": self.col.mod,
             "scm": self.scm(),
             "usn": self.col.usn(),
             "ts": anki.utils.intTime(),
-            "media_usn": self.col.media.lastUsn(),
+            "media_usn": media_usn,
+            "musn": media_usn,
             "uname": self.session.name,
             "msg": "",
             "cont": True,
@@ -565,7 +575,7 @@ class Requests(object):
 
         parse_logger = logging.getLogger("ankisyncd.parse")
 
-        parse_logger.info("parse start: path=%s ct=%s te=%s len=%s", 
+        parse_logger.info("parse start: path=%s ct=%s te=%s len=%s",
                           env.get("PATH_INFO"), content_type, te, length)
 
         if "application/json" in content_type and length > 0:
@@ -720,7 +730,7 @@ class encode_response(object):
         clss = args[0]
         environ = args[1]
         start_response = args[2]
-        logger.info("encode_response: path=%s ct=%s len=%s, headers: anki-sync=%s", 
+        logger.info("encode_response: path=%s ct=%s len=%s, headers: anki-sync=%s",
                      environ.get("PATH_INFO"), environ.get("CONTENT_TYPE"), environ.get("CONTENT_LENGTH"),
                      environ.get("HTTP_ANKI_SYNC", "NOT SET"))
         b = Requests(environ)
