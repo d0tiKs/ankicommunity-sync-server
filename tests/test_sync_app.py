@@ -66,7 +66,7 @@ class SyncCollectionHandlerTest(CollectionTestBase):
         self.assertEqual(meta["mod"], self.collection.mod)
         self.assertEqual(meta["usn"], self.collection._usn)
         self.assertEqual(meta["uname"], self.session.name)
-        self.assertEqual(meta["musn"], self.collection.media.lastUsn())
+        self.assertEqual(meta["media_usn"], self.collection.media.lastUsn())
         self.assertEqual(meta["msg"], "")
         self.assertEqual(meta["cont"], True)
 

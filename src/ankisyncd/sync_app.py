@@ -89,18 +89,17 @@ def decode_octet_stream_body(body_bytes, environ):
     anki_sync = parse_anki_sync_header(environ)
     if anki_sync and anki_sync.get("v", 0) >= 11:
         # ZSTD-compressed request body
-        decompressed = pyzstd.decompress(body_bytes)
+        try:
+            decompressed = pyzstd.decompress(body_bytes)
+        except pyzstd.ZstdError:
+            raise HTTPBadRequest("invalid zstd data")
+        if len(decompressed) > 268435456:
+            raise HTTPBadRequest("zstd data too large")
         try:
             result = json.loads(decompressed.decode())
         except (UnicodeDecodeError, ValueError):
             # Binary data (e.g. upload), return wrapped in "data" key
             result = {"data": decompressed}
-            result["v"] = anki_sync["v"]
-            result["k"] = anki_sync.get("k", "")
-            result["s"] = anki_sync.get("s", "")
-            result["cv"] = anki_sync.get("c", "")
-            return result
-        # Merge header fields into data dict
         result["v"] = anki_sync["v"]
         result["k"] = anki_sync.get("k", "")
         result["s"] = anki_sync.get("s", "")
@@ -172,6 +171,7 @@ class SyncCollectionHandler(Syncer):
                 return version_int < [2, 2, 3]
         else:  # unknown client, assume current version
             return False
+        return False
 
     def meta(self, v=None, cv=None):
         if self._old_client(cv):
@@ -205,12 +205,6 @@ class SyncCollectionHandler(Syncer):
             "cont": True,
             "hostNum": 0,
         }
-
-    # v11 uses usn=-1 for pending items; usn>=minUsn would include items
-    # modified during this session (e.g. by applyGraves), causing them to
-    # be re-sent to the client.
-    def usnLim(self):
-        return "usn = -1"
 
     # ankidesktop >=2.1rc2 sends graves in applyGraves, but still expects
     # server-side deletions to be returned by start
@@ -637,7 +631,7 @@ class Requests(object):
                     parse_logger.info("parse chunked octet-stream: decoded as data: %s", result[:40] if isinstance(result, bytes) else result)
                     return request_items_dict
                 # Legacy multipart parsing (pre-v11 protocol)
-                bdry = chunks[0] if c >= 1 else b""
+                bdry = chunks[0] if chunks else b""
                 data = []
                 data_other = []
                 for i, chunk in enumerate(chunks):
@@ -716,8 +710,8 @@ class Requests(object):
         return request_items_dict
 
 
-class chunked(object):
-    """decorator"""
+class encode_response(object):
+    """decorator that encodes WSGI responses as ZSTD (v11+) or IO frames"""
 
     def __init__(self, func):
         wraps(func)(self)
@@ -726,7 +720,7 @@ class chunked(object):
         clss = args[0]
         environ = args[1]
         start_response = args[2]
-        logger.info("chunked: path=%s ct=%s len=%s, headers: anki-sync=%s", 
+        logger.info("encode_response: path=%s ct=%s len=%s, headers: anki-sync=%s", 
                      environ.get("PATH_INFO"), environ.get("CONTENT_TYPE"), environ.get("CONTENT_LENGTH"),
                      environ.get("HTTP_ANKI_SYNC", "NOT SET"))
         b = Requests(environ)
@@ -737,7 +731,7 @@ class chunked(object):
         try:
             w = self.__wrapped__(*args, **kwargs)
         except Exception as e:
-            logger.error("chunked: unhandled exception: %s", e, exc_info=True)
+            logger.error("encode_response: unhandled exception: %s", e, exc_info=True)
             raise
         if "application/octet-stream" in environ.get("CONTENT_TYPE", ""):
             anki_sync = parse_anki_sync_header(environ)
@@ -746,14 +740,14 @@ class chunked(object):
                 compressed = pyzstd.compress(raw)
                 resp = Response(compressed, content_type="application/octet-stream")
                 resp.headers["anki-original-size"] = str(len(raw))
-                logger.info("chunked: zstd response %s bytes -> %s bytes (orig-size=%s)", len(raw), len(compressed), len(raw))
+                logger.info("encode_response: zstd response %s bytes -> %s bytes (orig-size=%s)", len(raw), len(compressed), len(raw))
             else:
                 if isinstance(w, str):
                     w = encode_io_frame(w)
                 elif isinstance(w, bytes):
                     w = encode_io_frame(w)
                 resp = Response(w, content_type="application/octet-stream")
-                logger.info("chunked: octet-stream response %s bytes, head hex: %s", len(w), w[:20].hex())
+                logger.info("encode_response: octet-stream response %s bytes, head hex: %s", len(w), w[:20].hex())
         else:
             resp = Response(w)
         return resp(environ, start_response)
@@ -856,7 +850,7 @@ class SyncApp:
         # local copy in Anki
         return self.full_sync_manager.download(col, session)
 
-    @chunked
+    @encode_response
     def __call__(self, req):
         # cgi file can only be read once,and will be blocked after being read once more
         # so i call Requests.parse only once,and bind its return result to properties

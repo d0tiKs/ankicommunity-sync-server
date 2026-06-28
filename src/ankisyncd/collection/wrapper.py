@@ -1,3 +1,4 @@
+import logging
 import os
 import anki.storage
 
@@ -66,7 +67,8 @@ class CollectionWrapper:
         try:
             col.media.close()
         except AttributeError:
-            pass
+            logger = logging.getLogger(__name__)
+            logger.warning("col.media has no close()")
         col.media = ankisyncd.media.ServerMediaManager(col)
 
         return col
